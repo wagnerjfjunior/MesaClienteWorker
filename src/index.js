@@ -13,10 +13,12 @@
  * - Extras não canônicos (ex.: 'vagas' e datas) são incorporados em 'observacoes'.
  */
 
-const VERSION = "v1.4.8 FinalInferencer+ResilientHeaderMap+CSVStringFix";
-
-// ===== Config (troque no painel de Env Vars do Cloudflare) ==================
-const DEFAULT_MAKE_URL = "https://hook.us2.make.com/e1y7iwjr5hhp9wdt8ayo1bk3lmvom48q";
+const VERSION = "v1.5.0 AuthenticatedServiceBoundary";
+const MAX_REQUEST_BYTES = 1024 * 1024;
+const MAX_TEXT_BYTES = 900 * 1024;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAKE_TIMEOUT_MS = 12_000;
+const ALLOWED_PAYLOAD_KEYS = new Set(["mode", "text", "filename", "empreendimento"]);
 
 // ===== CSV canônico (17 colunas) ============================================
 const CANON = [
@@ -71,11 +73,74 @@ function norm(s = "") {
     .trim();
 }
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, x-mesa-version"
-};
+// No browser CORS grant is exposed: production processing is server-to-server.
+const CORS_HEADERS = {};
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" }
+  });
+}
+
+function utf8Bytes(value = "") {
+  return new TextEncoder().encode(String(value ?? "")).byteLength;
+}
+
+async function sha256Bytes(value) {
+  return new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(String(value ?? ""))
+  ));
+}
+
+function constantTimeEqual(a, b) {
+  if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array) || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+async function isAuthorizedService(request, env) {
+  const presented = request.headers.get("x-fechai-worker-key") || "";
+  const configured = [env.MESA_WORKER_SERVICE_SECRET, env.MESA_WORKER_SERVICE_SECRET_NEXT]
+    .filter(v => typeof v === "string" && v.length >= 32);
+
+  if (!presented || configured.length === 0) return false;
+
+  const presentedDigest = await sha256Bytes(presented);
+  for (const candidate of configured) {
+    const candidateDigest = await sha256Bytes(candidate);
+    if (constantTimeEqual(presentedDigest, candidateDigest)) return true;
+  }
+  return false;
+}
+
+function validatePayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "JSON object required.";
+
+  for (const key of Object.keys(payload)) {
+    if (!ALLOWED_PAYLOAD_KEYS.has(key)) return `Unknown field: ${key}`;
+  }
+
+  if (payload.mode !== "mergeY") return "Unsupported mode.";
+  if (typeof payload.text !== "string" || payload.text.trim().length < 10) return "Text is missing or too short.";
+  if (utf8Bytes(payload.text) > MAX_TEXT_BYTES) return "Text payload is too large.";
+
+  if (payload.filename != null) {
+    if (typeof payload.filename !== "string" || utf8Bytes(payload.filename) > 255 || /[\\/\x00-\x1f\x7f]/.test(payload.filename)) {
+      return "Invalid filename.";
+    }
+  }
+
+  if (payload.empreendimento != null) {
+    if (typeof payload.empreendimento !== "string" || utf8Bytes(payload.empreendimento) > 256 || /[\x00-\x1f\x7f]/.test(payload.empreendimento)) {
+      return "Invalid empreendimento.";
+    }
+  }
+
+  return null;
+}
 
 function detectsCommaVsSemicolon(headerLine) {
   const sc = (headerLine.match(/;/g) || []).length;
@@ -342,37 +407,63 @@ function sanitizeCsvText(txt = "") {
 }
 
 // ===== HTTP Handlers ========================================================
-async function handleOptions() { return new Response("", { status: 204, headers: CORS_HEADERS }); }
+async function handleOptions() {
+  // The processing endpoint is intentionally not CORS-enabled.
+  return new Response("", { status: 204, headers: { "Cache-Control": "no-store" } });
+}
 
 async function handleHealth() {
-  const body = { ok: true, version: VERSION, now: new Date().toISOString() };
-  return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+  return jsonResponse({ ok: true, version: VERSION, now: new Date().toISOString() });
 }
 
 async function forwardToMake(env, payload) {
-  const makeURL = env.MAKE_URL || DEFAULT_MAKE_URL;
-  const res = await fetch(makeURL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  const makeURL = env.MAKE_URL;
+  if (!makeURL) return { ok: false, status: 503, code: "MAKE_CONFIG_UNAVAILABLE", csv_text: "" };
 
-  const contentType = res.headers.get("content-type") || "";
-  let rawBody = await res.text();
-  let csvText = "";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MAKE_TIMEOUT_MS);
 
-  if (contentType.includes("application/json")) {
-    try {
-      const j = JSON.parse(rawBody);
-      if (typeof j.csv_text === "string") csvText = j.csv_text;
-      else if (j.csv_text != null) csvText = String(j.csv_text);
-      else csvText = rawBody; // fallback
-    } catch { csvText = rawBody; }
-  } else {
-    csvText = rawBody; // rota B (texto)
+  try {
+    const res = await fetch(makeURL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+
+    const responseBytes = new Uint8Array(await res.arrayBuffer());
+    if (responseBytes.byteLength > MAX_RESPONSE_BYTES) {
+      return { ok: false, status: 502, code: "MAKE_RESPONSE_TOO_LARGE", csv_text: "" };
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    const rawBody = new TextDecoder().decode(responseBytes);
+    let csvText = "";
+
+    if (contentType.includes("application/json")) {
+      try {
+        const j = JSON.parse(rawBody);
+        if (typeof j.csv_text === "string") csvText = j.csv_text;
+        else if (j.csv_text != null) csvText = String(j.csv_text);
+        else csvText = rawBody;
+      } catch {
+        csvText = rawBody;
+      }
+    } else {
+      csvText = rawBody;
+    }
+
+    return { ok: res.ok, status: res.status, code: res.ok ? null : "MAKE_REQUEST_FAILED", csv_text: csvText };
+  } catch (error) {
+    return {
+      ok: false,
+      status: error?.name === "AbortError" ? 504 : 502,
+      code: error?.name === "AbortError" ? "MAKE_TIMEOUT" : "MAKE_UNAVAILABLE",
+      csv_text: ""
+    };
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return { ok: res.ok, status: res.status, csv_text: csvText, content_type: contentType || "text/plain" };
 }
 
 function preprocessTextForMake(text) {
@@ -381,43 +472,64 @@ function preprocessTextForMake(text) {
 }
 
 async function handlePost(request, env) {
-  let payload = {};
+  if (!(await isAuthorizedService(request, env))) {
+    return jsonResponse({ ok: false, code: "SERVICE_AUTH_REQUIRED" }, 401);
+  }
+
+  const requestId = String(request.headers.get("x-fechai-request-id") || "").trim();
+  if (!requestId || requestId.length > 128) {
+    return jsonResponse({ ok: false, code: "REQUEST_ID_REQUIRED" }, 400);
+  }
+
   const ct = (request.headers.get("content-type") || "").toLowerCase();
-
-  if (ct.includes("application/json")) {
-    try { payload = await request.json(); } catch { payload = {}; }
-  } else if (ct.includes("multipart/form-data")) {
-    const form = await request.formData();
-    payload = {
-      mode: (form.get("mode") || "mergeY"),
-      empreendimento: (form.get("empreendimento") || ""),
-      text: String(form.get("text") || "")
-    };
-  } else if (ct.includes("text/plain")) {
-    const text = await request.text();
-    payload = { mode: "mergeY", empreendimento: "", text };
-  } else {
-    // tenta plain text como último recurso
-    const raw = await request.text();
-    try { payload = JSON.parse(raw); } catch { payload = { mode: "mergeY", empreendimento: "", text: raw }; }
+  if (!ct.startsWith("application/json")) {
+    return jsonResponse({ ok: false, code: "JSON_REQUIRED" }, 415);
   }
 
-  const text = String(payload.text || "");
-  if (!text || text.trim().length < 10) {
-    return new Response(JSON.stringify({ ok:false, version:VERSION, error:"Texto muito curto ou ausente em 'text'." }), {
-      status: 400, headers: { "Content-Type":"application/json", ...CORS_HEADERS }
-    });
+  const declaredLength = Number.parseInt(request.headers.get("content-length") || "0", 10);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
+    return jsonResponse({ ok: false, code: "PAYLOAD_TOO_LARGE", request_id: requestId }, 413);
   }
 
-  // Pré-processa texto p/ ajudar o modelo a preencher 'final'
-  const preText = preprocessTextForMake(text);
-  const upstream = await forwardToMake(env, { ...payload, text: preText });
+  const rawBytes = new Uint8Array(await request.arrayBuffer());
+  if (rawBytes.byteLength > MAX_REQUEST_BYTES) {
+    return jsonResponse({ ok: false, code: "PAYLOAD_TOO_LARGE", request_id: requestId }, 413);
+  }
 
-  // Sanitiza + normaliza CSV
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(rawBytes));
+  } catch {
+    return jsonResponse({ ok: false, code: "INVALID_JSON", request_id: requestId }, 400);
+  }
+
+  const validationError = validatePayload(payload);
+  if (validationError) {
+    return jsonResponse({ ok: false, code: "INVALID_PAYLOAD", error: validationError, request_id: requestId }, 400);
+  }
+
+  const preText = preprocessTextForMake(payload.text);
+  const upstream = await forwardToMake(env, { ...payload, text: preText, request_id: requestId });
+
+  if (!upstream.ok) {
+    return jsonResponse({
+      ok: false,
+      code: upstream.code || "DOWNSTREAM_FAILED",
+      request_id: requestId
+    }, upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502);
+  }
+
   const csv = sanitizeCsvText(upstream.csv_text);
+  if (utf8Bytes(csv) > MAX_RESPONSE_BYTES) {
+    return jsonResponse({ ok: false, code: "NORMALIZED_RESPONSE_TOO_LARGE", request_id: requestId }, 502);
+  }
 
-  const body = { ok:true, version:VERSION, make_status: upstream.status, csv_text: csv };
-  return new Response(JSON.stringify(body), { status:200, headers:{ "Content-Type":"application/json", ...CORS_HEADERS } });
+  return jsonResponse({
+    ok: true,
+    version: VERSION,
+    csv_text: csv,
+    request_id: requestId
+  });
 }
 
 // ===== Worker entrypoint ====================================================
@@ -425,13 +537,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return handleOptions();
-    if (url.pathname === "/health") return handleHealth();
-    if (request.method === "POST") return handlePost(request, env);
-    // GET padrão: ajuda
-    return new Response(JSON.stringify({
-      ok: true,
-      version: VERSION,
-      hint: "POST com JSON { mode, empreendimento, text } → encaminha ao MAKE_URL e retorna csv_text canônico (17 colunas). Use /health para checagem."
-    }), { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+    if (request.method === "GET" && url.pathname === "/health") return handleHealth();
+    if (request.method === "POST" && url.pathname === "/parse") return handlePost(request, env);
+    return jsonResponse({ ok: false, code: "NOT_FOUND" }, 404);
   }
 };
