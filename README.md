@@ -27,6 +27,8 @@ Configure in Cloudflare without committing values:
 
 Never place these values in GitHub, `VITE_*`, browser responses, URLs or normal logs.
 
+The Make webhook value that previously existed as a source fallback must be treated as exposed and rotated before hardened Production deployment. Removing it from the current file does not revoke a historical webhook URL.
+
 ## Routes
 
 - `GET /health` — public minimal health/version response.
