@@ -3,11 +3,11 @@
  * FinalInferencer + ResilientHeaderMap + CSVStringFix
  *
  * O que faz:
- * - Rotas: OPTIONS (CORS), GET /health, POST (principal).
+ * - Rotas: GET /health e POST /parse autenticado; demais rotas = 404.
  * - Recebe { mode, empreendimento, text } — text = conteúdo extraído do PDF (UI usa pdf.js).
  * - Pré-processa o texto: insere marcadores "### FINAL: X" quando detectar cabeçalhos de seção
  *   (Final/Coluna/Face/Linha) e adiciona instrução curta para o modelo preencher a coluna 'final'.
- * - Encaminha para MAKE_URL (Make.com), aceita resposta JSON {csv_text} ou texto puro.
+ * - Encaminha para MAKE_URL (Make.com) somente após autenticação service-to-service.
  * - Sanitiza CSV, resolve separador, aplica mapeamento de cabeçalhos (aliases → 17 colunas canônicas),
  *   reordena, preenche faltas, carry-forward de 'final' e unidade sintética quando necessário.
  * - Extras não canônicos (ex.: 'vagas' e datas) são incorporados em 'observacoes'.
