@@ -1,27 +1,57 @@
 # MesaClienteWorker
-Worker CloudFlare para Mesa Cliente 
 
-# Mesa Cliente Worker
+Worker Cloudflare do fallback de processamento da Mesa Cliente.
 
-Worker responsável pelo processamento de tabelas do Mesa Cliente.
+## Production security contract
 
-## Objetivo
+Production processing is server-to-server only:
 
-Receber tabelas/PDF/texto, extrair ou normalizar os dados e retornar uma estrutura utilizável pelo Mesa Cliente no FECH.AI.
+```text
+authenticated FECH.AI browser
+→ FECH.AI /api/mesa-worker mediator
+→ x-fechai-worker-key
+→ POST /parse
+→ Worker
+→ MAKE_URL
+```
 
-## Estrutura
+The Worker must not be called directly by browser code.
 
-- `src/index.js`: código principal do Worker
-- `wrangler.jsonc`: configuração Cloudflare Worker
-- `package.json`: scripts e dependências do projeto
+### Required Worker secrets / environment
 
-## Rotas esperadas
+Configure in Cloudflare without committing values:
 
-- `GET /health`
-- `POST /parse`
-- `POST /extract-text`
-- `POST /normalize-table`
+- `MESA_WORKER_SERVICE_SECRET` — current FECH.AI→Worker credential.
+- `MESA_WORKER_SERVICE_SECRET_NEXT` — optional overlap credential for bounded rotation.
+- `MAKE_URL` — downstream Make webhook URL.
 
-## Observação importante
+Never place these values in GitHub, `VITE_*`, browser responses, URLs or normal logs.
 
-Não salvar tokens, senhas, chaves de API ou secrets neste repositório.
+## Routes
+
+- `GET /health` — public minimal health/version response.
+- `POST /parse` — requires the service credential and a bounded JSON contract.
+- all other routes — 404.
+
+## Safety boundaries
+
+- JSON only.
+- 1 MiB request ceiling.
+- 900 KiB text ceiling.
+- 2 MiB response ceiling.
+- `mode` allowlist currently contains only `mergeY`.
+- explicit downstream timeout.
+- no browser CORS grant.
+- no default/fallback Make webhook in source.
+
+## Deployment order
+
+To avoid breaking the supported fallback:
+
+1. Provision the same production service credential in Vercel and Cloudflare.
+2. Deploy the FECH.AI authenticated mediator/client migration first.
+3. Confirm the mediator can reach the current Worker.
+4. Deploy this Worker hardening so direct anonymous/browser processing fails closed.
+5. Run non-hostile post-deploy checks and then proceed to rate/abuse controls.
+
+Security Go remains a separate FECH.AI gate.
