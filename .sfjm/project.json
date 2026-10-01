@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "project": "MesaClienteWorker",
+  "repository": {
+    "fullName": "wagnerjfjunior/MesaClienteWorker",
+    "defaultBranch": "main"
+  },
+  "local": {
+    "preferredPort": 8094,
+    "route": "/"
+  },
+  "runtime": {
+    "mode": "auto"
+  },
+  "validation": {
+    "commands": []
+  },
+  "promotion": {
+    "policy": "local-first-remote-on-promotion",
+    "remoteIterationAllowed": false,
+    "pushRequiresExplicitIntent": true,
+    "deployRequiresExplicitIntent": true
+  }
+}
